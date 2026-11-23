@@ -29,15 +29,15 @@ class Fail {
 
 const blank = (s: string): boolean => s.trim() === '';
 
-const trailingWs = (s: string): string => s.replace(/[ \t]+$/, '');
-const edgeWs = (s: string): string => trailingWs(s.replace(/^[ \t]+/, ''));
+const tw = (s: string): string => s.replace(/[ \t]+$/, '');
+const edgeWs = (s: string): string => tw(s.replace(/^[ \t]+/, ''));
 
 /** The first tier (SPEC.md section 5) at which O occurs in the file, and its positions. */
-function matchLines(fileLines: string[], oldLines: string[], strict: boolean): { tier: number; positions: number[] } | null {
+function locateLines(fileLines: string[], oldLines: string[], strict: boolean): { tier: number; positions: number[] } | null {
   if (oldLines.length === 0) return { tier: 0, positions: Array.from({ length: fileLines.length + 1 }, (_, i) => i) };
   const tiers = strict ? [0] : [0, 1, 2];
   for (const tier of tiers) {
-    const norm = (s: string): string => (tier === 0 ? s : tier === 1 ? trailingWs(s) : edgeWs(s));
+    const norm = (s: string): string => (tier === 0 ? s : tier === 1 ? tw(s) : edgeWs(s));
     const old = oldLines.map(norm);
     const positions: number[] = [];
     for (let i = 0; i + oldLines.length <= fileLines.length; i += 1) {
@@ -55,15 +55,15 @@ function matchLines(fileLines: string[], oldLines: string[], strict: boolean): {
   return null;
 }
 
+function safe(p: string): boolean {
+  return p !== '' && !p.startsWith('/') && !p.includes('\\') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
+}
+
 function patchLines(text: string): string[] {
   if (text === '') return [];
   const lines = text.split('\n');
   if (text.endsWith('\n')) lines.pop();
   return lines.map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
-}
-
-function safe(p: string): boolean {
-  return p !== '' && !p.startsWith('/') && !p.includes('\\') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
 }
 
 /** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
@@ -194,7 +194,7 @@ function jsonEdits(text: string, lines: string[]): Edit[] {
 /** The edits of the SEARCH/REPLACE blocks (SPEC.md section 7), in patch order. */
 function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
   const edits: Edit[] = [];
-  const marker = (l: string, m: string): boolean => trailingWs(l) === m;
+  const marker = (l: string, m: string): boolean => tw(l) === m;
   let prevPath: string | null = null;
   let prevEnd = 0;
   for (let i = 0; i < lines.length; i += 1) {
@@ -231,7 +231,7 @@ function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
       const fileLines = before === '' ? [] : before.split(br);
       const final = before !== '' && before.endsWith(br);
       if (final) fileLines.pop();
-      const found = matchLines(fileLines, oldLines, strict);
+      const found = locateLines(fileLines, oldLines, strict);
       if (found === null) throw new Fail('no-match', p);
       if (found.positions.length > 1) throw new Fail('ambiguous', p);
       const at = found.positions[0]!;
@@ -255,7 +255,7 @@ function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
 // ---- Section 5 helpers shared by unified and V4A ----
 
 const tierNorm = (tier: number): ((s: string) => string) =>
-  tier === 0 ? (s) => s : tier === 1 ? trailingWs : edgeWs;
+  tier === 0 ? (s) => s : tier === 1 ? tw : edgeWs;
 const indentOf = (s: string): string => /^[ \t]*/.exec(s)![0];
 
 interface Piece {
@@ -377,7 +377,7 @@ function applyHunks(st: { lines: string[]; br: string; final: boolean }, hunks: 
     const noNl = lastCn >= 0 && h.items[lastCn + 1]?.t === 'bs';
     let endAtEnd = false;
     if (O.length > 0) {
-      const found = matchLines(st.lines, O.map((o) => o.s), strict);
+      const found = locateLines(st.lines, O.map((o) => o.s), strict);
       if (found === null) throw new Fail('no-match', path);
       const target = h.a - 1 + d;
       let best = found.positions[0]!;
