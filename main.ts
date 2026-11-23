@@ -207,64 +207,82 @@ function jsonEdits(patchText: string, patchLines: string[]): Edit[] {
 }
 
 /** The edits of the SEARCH/REPLACE blocks (SPEC.md section 7), in patch order. */
-function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
-  const edits: Edit[] = [];
-  const marker = (l: string, m: string): boolean => trimTrailing(l) === m;
-  let prevPath: string | null = null;
-  let prevEnd = 0;
-  for (let i = 0; i < lines.length; i += 1) {
-    if (!marker(lines[i]!, '<<<<<<< SEARCH')) continue;
-    const search = i;
-    const eq = lines.findIndex((l, j) => j > search && marker(l, '======='));
-    const rep = eq < 0 ? -1 : lines.findIndex((l, j) => j > eq && marker(l, '>>>>>>> REPLACE'));
-    if (eq < 0 || rep < 0) throw new ParseExit(`error: parse ${search + 1}`);
-    let path: string | null = null;
-    for (let j = search - 1; j >= prevEnd; j -= 1) {
-      const cand = lines[j]!;
-      if (isBlank(cand)) continue;
-      const trimmed = trimEdges(cand);
-      if (trimmed.startsWith('```')) continue;
-      path = trimmed;
+function searchReplaceEdits(sourceLines: string[], isStrict: boolean): Edit[] {
+  const result: Edit[] = [];
+  const isMarker = (line: string, target: string): boolean => trimTrailing(line) === target;
+
+  let lastKnownPath: string | null = null;
+  let afterLastBlock = 0;
+
+  for (let idx = 0; idx < sourceLines.length; idx += 1) {
+    if (!isMarker(sourceLines[idx]!, '<<<<<<< SEARCH')) continue;
+
+    const searchStart = idx;
+    const dividerIdx = sourceLines.findIndex((ln, j) => j > searchStart && isMarker(ln, '======='));
+    const replaceEnd = dividerIdx < 0 ? -1 : sourceLines.findIndex((ln, j) => j > dividerIdx && isMarker(ln, '>>>>>>> REPLACE'));
+    if (dividerIdx < 0 || replaceEnd < 0) throw new ParseExit(`error: parse ${searchStart + 1}`);
+
+    let blockPath: string | null = null;
+    for (let back = searchStart - 1; back >= afterLastBlock; back -= 1) {
+      const candidate = sourceLines[back]!;
+      if (isBlank(candidate)) continue;
+      const cleaned = trimEdges(candidate);
+      if (cleaned.startsWith('```')) continue;
+      blockPath = cleaned;
       break;
     }
-    if (path === null) path = prevPath;
-    if (path === null) throw new ParseExit(`error: parse ${search + 1}`);
-    const oldLines = lines.slice(search + 1, eq);
-    const newLines = lines.slice(eq + 1, rep);
-    const p = path;
-    edits.push((tree) => {
-      if (!safe(p)) throw new Fail('unsafe', p);
-      if (oldLines.length === 0) {
-        if (tree.get(p) !== null) throw new Fail('exists', p);
-        tree.now.set(p, newLines.length === 0 ? '' : `${newLines.join('\n')}\n`);
+    if (blockPath === null) blockPath = lastKnownPath;
+    if (blockPath === null) throw new ParseExit(`error: parse ${searchStart + 1}`);
+
+    const searchContent = sourceLines.slice(searchStart + 1, dividerIdx);
+    const replaceContent = sourceLines.slice(dividerIdx + 1, replaceEnd);
+    const targetPath = blockPath;
+
+    result.push((tree: Tree) => {
+      if (!safe(targetPath)) throw new Fail('unsafe', targetPath);
+
+      if (searchContent.length === 0) {
+        if (tree.get(targetPath) !== null) throw new Fail('exists', targetPath);
+        tree.now.set(targetPath, replaceContent.length === 0 ? '' : `${replaceContent.join('\n')}\n`);
         return;
       }
-      const before = tree.get(p);
-      if (before === null) throw new Fail('missing', p);
-      const nl = before.indexOf('\n');
-      const br = nl > 0 && before[nl - 1] === '\r' ? '\r\n' : '\n';
-      const fileLines = before === '' ? [] : before.split(br);
-      const final = before !== '' && before.endsWith(br);
-      if (final) fileLines.pop();
-      const found = locateLines(fileLines, oldLines, strict);
-      if (found === null) throw new Fail('no-match', p);
-      if (found.positions.length > 1) throw new Fail('ambiguous', p);
-      const at = found.positions[0]!;
-      let outLines = newLines;
-      if (found.tier === 2) {
-        const indent = (s: string): string => /^[ \t]*/.exec(s)![0];
-        const f = indent(fileLines[at]!);
-        const pIndent = indent(oldLines[0]!);
-        outLines = newLines.map((l) => (l.trim() !== '' && l.startsWith(pIndent) ? f + l.slice(pIndent.length) : l));
+
+      const original = tree.get(targetPath);
+      if (original === null) throw new Fail('missing', targetPath);
+
+      const firstNewline = original.indexOf('\n');
+      const lineBreak = firstNewline > 0 && original[firstNewline - 1] === '\r' ? '\r\n' : '\n';
+      const fileParts = original === '' ? [] : original.split(lineBreak);
+      const hasTrailingBreak = original !== '' && original.endsWith(lineBreak);
+      if (hasTrailingBreak) fileParts.pop();
+
+      const match = locateLines(fileParts, searchContent, isStrict);
+      if (match === null) throw new Fail('no-match', targetPath);
+      if (match.positions.length > 1) throw new Fail('ambiguous', targetPath);
+
+      const insertAt = match.positions[0]!;
+      let outputLines = replaceContent;
+
+      if (match.tier === 2) {
+        const getIndent = (text: string): string => /^[ \t]*/.exec(text)![0];
+        const fileIndent = getIndent(fileParts[insertAt]!);
+        const searchIndent = getIndent(searchContent[0]!);
+        outputLines = replaceContent.map(ln =>
+          ln.trim() !== '' && ln.startsWith(searchIndent) ? fileIndent + ln.slice(searchIndent.length) : ln
+        );
       }
-      fileLines.splice(at, oldLines.length, ...outLines);
-      tree.now.set(p, fileLines.length === 0 ? '' : fileLines.join(br) + (final ? br : ''));
+
+      fileParts.splice(insertAt, searchContent.length, ...outputLines);
+      const rebuilt = fileParts.length === 0 ? '' : fileParts.join(lineBreak) + (hasTrailingBreak ? lineBreak : '');
+      tree.now.set(targetPath, rebuilt);
     });
-    prevPath = path;
-    prevEnd = rep + 1;
-    i = rep;
+
+    lastKnownPath = blockPath;
+    afterLastBlock = replaceEnd + 1;
+    idx = replaceEnd;
   }
-  return edits;
+
+  return result;
 }
 
 // ---- Section 5 helpers shared by unified and V4A ----
