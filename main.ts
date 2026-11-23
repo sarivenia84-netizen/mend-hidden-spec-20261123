@@ -102,93 +102,108 @@ function detect(lines: string[]): string | null {
 }
 
 /** One JSON edit object (SPEC.md section 9), or null when it is not one. */
-function jsonEdit(v: unknown): Edit | null {
-  if (v === null || typeof v !== 'object' || Array.isArray(v)) return null;
-  const o = v as Record<string, unknown>;
-  const p = o.path;
-  if (typeof p !== 'string') return null;
-  const exists = (tree: Tree): string => {
-    if (!safe(p)) throw new Fail('unsafe', p);
-    const t = tree.get(p);
-    if (t === null) throw new Fail('missing', p);
-    return t;
+function jsonEdit(payload: unknown): Edit | null {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    return null;
+  }
+  const obj = payload as Record<string, unknown>;
+  const path = obj.path;
+  if (typeof path !== 'string') return null;
+
+  const requireFile = (t: Tree): string => {
+    if (!safe(path)) throw new Fail('unsafe', path);
+    const content = t.get(path);
+    if (content === null) throw new Fail('missing', path);
+    return content;
   };
-  if (o.command === 'create' && typeof o.file_text === 'string') {
-    const text = o.file_text;
-    return (tree) => {
-      if (!safe(p)) throw new Fail('unsafe', p);
-      if (tree.get(p) !== null) throw new Fail('exists', p);
-      tree.now.set(p, text);
+
+  const cmd = obj.command;
+  if (cmd === 'create' && typeof obj.file_text === 'string') {
+    const fileText = obj.file_text;
+    return (t: Tree) => {
+      if (!safe(path)) throw new Fail('unsafe', path);
+      if (t.get(path) !== null) throw new Fail('exists', path);
+      t.now.set(path, fileText);
     };
   }
-  if (o.command === 'str_replace' && typeof o.old_str === 'string' && o.old_str !== '' && (o.new_str === undefined || typeof o.new_str === 'string')) {
-    const oldStr = o.old_str;
-    const newStr = (o.new_str as string | undefined) ?? '';
-    return (tree) => {
-      const before = exists(tree);
-      const nl = before.indexOf('\n');
-      const crlf = nl > 0 && before[nl - 1] === '\r';
-      const lf = (s: string): string => (crlf ? s.replaceAll('\r\n', '\n') : s);
-      const t = lf(before);
-      const old = lf(oldStr);
-      let count = 0;
-      for (let k = t.indexOf(old); k >= 0; k = t.indexOf(old, k + 1)) count += 1;
-      if (count === 0) throw new Fail('no-match', p);
-      if (count > 1) throw new Fail('ambiguous', p);
-      const at = t.indexOf(old);
-      const out = t.slice(0, at) + lf(newStr) + t.slice(at + old.length);
-      tree.now.set(p, crlf ? out.replaceAll('\n', '\r\n') : out);
+
+  if (cmd === 'str_replace' && typeof obj.old_str === 'string' && obj.old_str !== '' &&
+      (obj.new_str === undefined || typeof obj.new_str === 'string')) {
+    const oldStr = obj.old_str;
+    const newStr = (obj.new_str as string | undefined) ?? '';
+    return (t: Tree) => {
+      const original = requireFile(t);
+      const firstNl = original.indexOf('\n');
+      const isCrlf = firstNl > 0 && original[firstNl - 1] === '\r';
+      const toLf = (s: string): string => isCrlf ? s.replaceAll('\r\n', '\n') : s;
+      const src = toLf(original);
+      const find = toLf(oldStr);
+      let matches = 0;
+      for (let idx = src.indexOf(find); idx >= 0; idx = src.indexOf(find, idx + 1)) {
+        matches += 1;
+      }
+      if (matches === 0) throw new Fail('no-match', path);
+      if (matches > 1) throw new Fail('ambiguous', path);
+      const pos = src.indexOf(find);
+      const result = src.slice(0, pos) + toLf(newStr) + src.slice(pos + find.length);
+      t.now.set(path, isCrlf ? result.replaceAll('\n', '\r\n') : result);
     };
   }
-  if (o.command === 'insert' && typeof o.insert_line === 'number' && Number.isInteger(o.insert_line) && typeof o.new_str === 'string') {
-    const line = o.insert_line;
-    const add = patchLines(o.new_str);
-    return (tree) => {
-      const before = exists(tree);
-      const nl = before.indexOf('\n');
-      const br = nl > 0 && before[nl - 1] === '\r' ? '\r\n' : '\n';
-      const lines = before === '' ? [] : before.split(br);
-      const final = before !== '' && before.endsWith(br);
-      if (final) lines.pop();
-      if (line < 0 || line > lines.length) throw new Fail('no-match', p);
-      lines.splice(line, 0, ...add);
-      tree.now.set(p, lines.length === 0 ? '' : lines.join(br) + (final ? br : ''));
+
+  if (cmd === 'insert' && typeof obj.insert_line === 'number' && Number.isInteger(obj.insert_line) &&
+      typeof obj.new_str === 'string') {
+    const insertAt = obj.insert_line;
+    const toInsert = patchLines(obj.new_str);
+    return (t: Tree) => {
+      const original = requireFile(t);
+      const firstNl = original.indexOf('\n');
+      const breakChar = firstNl > 0 && original[firstNl - 1] === '\r' ? '\r\n' : '\n';
+      const lineArray = original === '' ? [] : original.split(breakChar);
+      const hasTrailingBreak = original !== '' && original.endsWith(breakChar);
+      if (hasTrailingBreak) lineArray.pop();
+      if (insertAt < 0 || insertAt > lineArray.length) throw new Fail('no-match', path);
+      lineArray.splice(insertAt, 0, ...toInsert);
+      const joined = lineArray.length === 0 ? '' : lineArray.join(breakChar) + (hasTrailingBreak ? breakChar : '');
+      t.now.set(path, joined);
     };
   }
+
   return null;
 }
 
-function jsonEdits(text: string, lines: string[]): Edit[] {
-  const first = lines.findIndex((l) => !isBlank(l));
-  if (first < 0) throw new ParseExit('error: parse 1');
-  const edits: Edit[] = [];
-  if (lines[first]!.trimStart().startsWith('[')) {
-    let v: unknown;
+function jsonEdits(patchText: string, patchLines: string[]): Edit[] {
+  const firstIdx = patchLines.findIndex((l) => !isBlank(l));
+  if (firstIdx < 0) throw new ParseExit('error: parse 1');
+  const results: Edit[] = [];
+  const firstLine = patchLines[firstIdx]!.trimStart();
+  if (firstLine.startsWith('[')) {
+    let parsed: unknown;
     try {
-      v = JSON.parse(text);
+      parsed = JSON.parse(patchText);
     } catch {
-      throw new ParseExit(`error: parse ${first + 1}`);
+      throw new ParseExit(`error: parse ${firstIdx + 1}`);
     }
-    if (!Array.isArray(v)) throw new ParseExit(`error: parse ${first + 1}`);
-    for (const x of v) {
-      const e = jsonEdit(x);
-      if (e === null) throw new ParseExit(`error: parse ${first + 1}`);
-      edits.push(e);
+    if (!Array.isArray(parsed)) throw new ParseExit(`error: parse ${firstIdx + 1}`);
+    for (const item of parsed) {
+      const edit = jsonEdit(item);
+      if (edit === null) throw new ParseExit(`error: parse ${firstIdx + 1}`);
+      results.push(edit);
     }
-    return edits;
+    return results;
   }
-  lines.forEach((l, i) => {
-    if (isBlank(l)) return;
-    let e: Edit | null = null;
+  for (let i = 0; i < patchLines.length; i++) {
+    const line = patchLines[i]!;
+    if (isBlank(line)) continue;
+    let edit: Edit | null = null;
     try {
-      e = jsonEdit(JSON.parse(l));
+      edit = jsonEdit(JSON.parse(line));
     } catch {
-      e = null;
+      edit = null;
     }
-    if (e === null) throw new ParseExit(`error: parse ${i + 1}`);
-    edits.push(e);
-  });
-  return edits;
+    if (edit === null) throw new ParseExit(`error: parse ${i + 1}`);
+    results.push(edit);
+  }
+  return results;
 }
 
 /** The edits of the SEARCH/REPLACE blocks (SPEC.md section 7), in patch order. */
