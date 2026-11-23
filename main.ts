@@ -704,87 +704,127 @@ function parseV4aPatch(srcLines: string[], strictMode: boolean): Edit[] {
 }
 
 function run(args: string[]): { code: number; out: string[] } {
-  let format: string | null = null;
-  let check = false;
-  let strict = false;
-  const pos: string[] = [];
-  let ended = false;
-  for (const a of args) {
-    if (!ended && a === '--') ended = true;
-    else if (!ended && a.startsWith('-') && a !== '-') {
-      if (a.startsWith('--format=') && format === null && SUPPORTED_FORMATS.includes(a.slice(9))) format = a.slice(9);
-      else if (a === '--check' && !check) check = true;
-      else if (a === '--strict' && !strict) strict = true;
-      else return { code: 2, out: ['error: usage'] };
-    } else pos.push(a);
+  let selectedFormat: string | null = null;
+  let dryRun = false;
+  let strictMode = false;
+  const positional: string[] = [];
+  let pastDoubleDash = false;
+
+  for (const arg of args) {
+    if (!pastDoubleDash && arg === '--') {
+      pastDoubleDash = true;
+      continue;
+    }
+    if (!pastDoubleDash && arg.startsWith('-') && arg !== '-') {
+      if (arg.startsWith('--format=') && selectedFormat === null && SUPPORTED_FORMATS.includes(arg.slice(9))) {
+        selectedFormat = arg.slice(9);
+      } else if (arg === '--check' && !dryRun) {
+        dryRun = true;
+      } else if (arg === '--strict' && !strictMode) {
+        strictMode = true;
+      } else {
+        return { code: 2, out: ['error: usage'] };
+      }
+    } else {
+      positional.push(arg);
+    }
   }
-  if (pos.length > 1) return { code: 2, out: ['error: usage'] };
-  const file = pos.length === 0 || pos[0] === '-' ? null : pos[0]!;
-  let text = '';
+
+  if (positional.length > 1) return { code: 2, out: ['error: usage'] };
+
+  const patchPath = positional.length === 0 || positional[0] === '-' ? null : positional[0]!;
+  let rawText = '';
   try {
-    text = readFileSync(file ?? 0, 'utf8');
+    rawText = readFileSync(patchPath ?? 0, 'utf8');
   } catch {
-    if (file !== null) return { code: 2, out: ['error: no-patch'] };
+    if (patchPath !== null) return { code: 2, out: ['error: no-patch'] };
   }
-  const lines = patchLines(text);
-  const kind = format === null || format === 'auto' ? detect(lines) : format;
-  if (kind === null) return { code: 2, out: ['error: format'] };
+
+  const patchLineArray = patchLines(rawText);
+  const detectedKind = selectedFormat === null || selectedFormat === 'auto' ? detect(patchLineArray) : selectedFormat;
+  if (detectedKind === null) return { code: 2, out: ['error: format'] };
+
   let edits: Edit[];
   try {
-    edits = kind === 'json' ? jsonEdits(text, lines) : kind === 'search-replace' ? searchReplaceEdits(lines, strict) : kind === 'unified' ? unifiedEdits(lines, strict) : kind === 'v4a' ? parseV4aPatch(lines, strict) : [];
+    if (detectedKind === 'json') edits = jsonEdits(rawText, patchLineArray);
+    else if (detectedKind === 'search-replace') edits = searchReplaceEdits(patchLineArray, strictMode);
+    else if (detectedKind === 'unified') edits = unifiedEdits(patchLineArray, strictMode);
+    else if (detectedKind === 'v4a') edits = parseV4aPatch(patchLineArray, strictMode);
+    else edits = [];
+
     if (edits.length === 0) throw new ParseExit('error: parse 1');
   } catch (e) {
     if (e instanceof ParseExit) return { code: 2, out: [e.line] };
     throw e;
   }
-  const tree = new Tree();
-  const fails: Fail[] = [];
+
+  const workingTree = new Tree();
+  const failedEdits: Fail[] = [];
+
   for (const edit of edits) {
-    const before = new Map(tree.now);
+    const snapshot = new Map(workingTree.now);
     try {
-      edit(tree);
+      edit(workingTree);
     } catch (e) {
       if (!(e instanceof Fail)) throw e;
-      tree.now.clear();
-      for (const [k, v] of before) tree.now.set(k, v);
-      fails.push(e);
+      workingTree.now.clear();
+      for (const [key, value] of snapshot) workingTree.now.set(key, value);
+      failedEdits.push(e);
     }
   }
-  if (fails.length > 0) return { code: 1, out: [...fails.map((f) => `error: ${f.code} ${f.path}`), `failed: ${fails.length} of ${edits.length} edits`] };
-  const rows = new Map<string, string>();
-  for (const p of [...tree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
-    const was = tree.original(p);
-    const now = tree.now.get(p)!;
-    if (was === now) continue;
-    rows.set(p, `${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}`);
+
+  if (failedEdits.length > 0) {
+    const messages = failedEdits.map(f => `error: ${f.code} ${f.path}`);
+    messages.push(`failed: ${failedEdits.length} of ${edits.length} edits`);
+    return { code: 1, out: messages };
   }
-  for (const [o, nw] of tree.moves) {
-    if (rows.get(o) === `D ${o}` && rows.get(nw) === `A ${nw}`) {
-      rows.delete(o);
-      rows.set(nw, `R ${o} -> ${nw}`);
+
+  const statusMap = new Map<string, string>();
+
+  const sortedPaths = [...workingTree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+  for (const path of sortedPaths) {
+    const originalContent = workingTree.original(path);
+    const newContent = workingTree.now.get(path)!;
+    if (originalContent === newContent) continue;
+    const code = originalContent === null ? 'A' : newContent === null ? 'D' : 'M';
+    statusMap.set(path, `${code} ${path}`);
+  }
+
+  for (const [oldPath, newPath] of workingTree.moves) {
+    if (statusMap.get(oldPath) === `D ${oldPath}` && statusMap.get(newPath) === `A ${newPath}`) {
+      statusMap.delete(oldPath);
+      statusMap.set(newPath, `R ${oldPath} -> ${newPath}`);
     }
   }
-  const out: string[] = [];
-  for (const p of [...rows.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
-    const row = rows.get(p)!;
-    out.push(row);
-    if (check) continue;
+
+  const outputLines: string[] = [];
+  const sortedStatusPaths = [...statusMap.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+
+  for (const path of sortedStatusPaths) {
+    const row = statusMap.get(path)!;
+    outputLines.push(row);
+    if (dryRun) continue;
+
     if (row.startsWith('R ')) {
-      const [o, nw] = [row.slice(2, row.indexOf(' -> ')), row.slice(row.indexOf(' -> ') + 4)];
-      rmSync(o, { force: true });
-      mkdirSync(dirname(nw), { recursive: true });
-      writeFileSync(nw, tree.now.get(p)!);
+      const arrowIndex = row.indexOf(' -> ');
+      const from = row.slice(2, arrowIndex);
+      const to = row.slice(arrowIndex + 4);
+      rmSync(from, { force: true });
+      mkdirSync(dirname(to), { recursive: true });
+      writeFileSync(to, workingTree.now.get(path)!);
     } else {
-      const now = tree.now.get(p)!;
-      if (now === null) rmSync(p, { force: true });
-      else {
-        mkdirSync(dirname(p), { recursive: true });
-        writeFileSync(p, now);
+      const content = workingTree.now.get(path)!;
+      if (content === null) {
+        rmSync(path, { force: true });
+      } else {
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, content);
       }
     }
   }
-  out.push(`ok: ${out.length} ${out.length === 1 ? 'file' : 'files'}`);
-  return { code: 0, out };
+
+  outputLines.push(`ok: ${outputLines.length} ${outputLines.length === 1 ? 'file' : 'files'}`);
+  return { code: 0, out: outputLines };
 }
 
 
