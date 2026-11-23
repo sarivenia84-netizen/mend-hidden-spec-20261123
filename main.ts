@@ -33,37 +33,35 @@ const trimTrailing = (s: string): string => s.replace(/[ \t]+$/, '');
 const trimEdges = (s: string): string => trimTrailing(s.replace(/^[ \t]+/, ''));
 
 /** The first tier (SPEC.md section 5) at which O occurs in the file, and its positions. */
-function locateLines(fileLines: string[], oldLines: string[], strict: boolean): { tier: number; positions: number[] } | null {
-  if (oldLines.length === 0) return { tier: 0, positions: Array.from({ length: fileLines.length + 1 }, (_, i) => i) };
-  const tiers = strict ? [0] : [0, 1, 2];
-  for (const tier of tiers) {
-    const norm = (s: string): string => (tier === 0 ? s : tier === 1 ? trimTrailing(s) : trimEdges(s));
-    const old = oldLines.map(norm);
-    const positions: number[] = [];
-    for (let i = 0; i + oldLines.length <= fileLines.length; i += 1) {
-      let hit = true;
-      for (let j = 0; j < oldLines.length; j += 1) {
-        if (norm(fileLines[i + j]!) !== old[j]) {
-          hit = false;
-          break;
-        }
+function findMatches(sourceLines: string[], searchLines: string[], strictMode: boolean): { level: number; indices: number[] } | null {
+  if (searchLines.length === 0) return { level: 0, indices: Array.from({ length: sourceLines.length + 1 }, (_, i) => i) };
+  const levels = strictMode ? [0] : [0, 1, 2];
+  for (const level of levels) {
+    const normalize = (s: string): string => level === 0 ? s : level === 1 ? trimTrailing(s) : trimEdges(s);
+    const target = searchLines.map(normalize);
+    const matches: number[] = [];
+    for (let i = 0; i + searchLines.length <= sourceLines.length; i++) {
+      let ok = true;
+      for (let j = 0; j < searchLines.length; j++) {
+        if (normalize(sourceLines[i + j]!) !== target[j]) { ok = false; break; }
       }
-      if (hit) positions.push(i);
+      if (ok) matches.push(i);
     }
-    if (positions.length > 0) return { tier, positions };
+    if (matches.length > 0) return { level, indices: matches };
   }
   return null;
 }
 
-function safe(p: string): boolean {
-  return p !== '' && !p.startsWith('/') && !p.includes('\\') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
+function isSafe(path: string): boolean {
+  if (path === '' || path.startsWith('/') || path.includes('\\')) return false;
+  return path.split('/').every(s => s !== '' && s !== '.' && s !== '..');
 }
 
-function patchLines(text: string): string[] {
+function splitPatchLines(text: string): string[] {
   if (text === '') return [];
-  const lines = text.split('\n');
-  if (text.endsWith('\n')) lines.pop();
-  return lines.map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
+  const parts = text.split('\n');
+  if (text.endsWith('\n')) parts.pop();
+  return parts.map(l => l.endsWith('\r') ? l.slice(0, -1) : l);
 }
 
 /** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
@@ -111,7 +109,7 @@ function jsonEdit(payload: unknown): Edit | null {
   if (typeof path !== 'string') return null;
 
   const requireFile = (t: Tree): string => {
-    if (!safe(path)) throw new Fail('unsafe', path);
+    if (!isSafe(path)) throw new Fail('unsafe', path);
     const content = t.get(path);
     if (content === null) throw new Fail('missing', path);
     return content;
@@ -121,7 +119,7 @@ function jsonEdit(payload: unknown): Edit | null {
   if (cmd === 'create' && typeof obj.file_text === 'string') {
     const fileText = obj.file_text;
     return (t: Tree) => {
-      if (!safe(path)) throw new Fail('unsafe', path);
+      if (!isSafe(path)) throw new Fail('unsafe', path);
       if (t.get(path) !== null) throw new Fail('exists', path);
       t.now.set(path, fileText);
     };
@@ -153,7 +151,7 @@ function jsonEdit(payload: unknown): Edit | null {
   if (cmd === 'insert' && typeof obj.insert_line === 'number' && Number.isInteger(obj.insert_line) &&
       typeof obj.new_str === 'string') {
     const insertAt = obj.insert_line;
-    const toInsert = patchLines(obj.new_str);
+    const toInsert = splitPatchLines(obj.new_str);
     return (t: Tree) => {
       const original = requireFile(t);
       const firstNl = original.indexOf('\n');
@@ -239,7 +237,7 @@ function searchReplaceEdits(sourceLines: string[], isStrict: boolean): Edit[] {
     const targetPath = blockPath;
 
     result.push((tree: Tree) => {
-      if (!safe(targetPath)) throw new Fail('unsafe', targetPath);
+      if (!isSafe(targetPath)) throw new Fail('unsafe', targetPath);
 
       if (searchContent.length === 0) {
         if (tree.get(targetPath) !== null) throw new Fail('exists', targetPath);
@@ -256,17 +254,16 @@ function searchReplaceEdits(sourceLines: string[], isStrict: boolean): Edit[] {
       const hasTrailingBreak = original !== '' && original.endsWith(lineBreak);
       if (hasTrailingBreak) fileParts.pop();
 
-      const match = locateLines(fileParts, searchContent, isStrict);
+      const match = findMatches(fileParts, searchContent, isStrict);
       if (match === null) throw new Fail('no-match', targetPath);
-      if (match.positions.length > 1) throw new Fail('ambiguous', targetPath);
+      if (match.indices.length > 1) throw new Fail('ambiguous', targetPath);
 
-      const insertAt = match.positions[0]!;
+      const insertAt = match.indices[0]!;
       let outputLines = replaceContent;
 
-      if (match.tier === 2) {
-        const getIndent = (text: string): string => /^[ \t]*/.exec(text)![0];
-        const fileIndent = getIndent(fileParts[insertAt]!);
-        const searchIndent = getIndent(searchContent[0]!);
+      if (match.level === 2) {
+        const fileIndent = indentOf(fileParts[insertAt]!);
+        const searchIndent = indentOf(searchContent[0]!);
         outputLines = replaceContent.map(ln =>
           ln.trim() !== '' && ln.startsWith(searchIndent) ? fileIndent + ln.slice(searchIndent.length) : ln
         );
@@ -287,9 +284,10 @@ function searchReplaceEdits(sourceLines: string[], isStrict: boolean): Edit[] {
 
 // ---- Section 5 helpers shared by unified and V4A ----
 
-const tierNormalizer = (tier: number): ((s: string) => string) =>
-  tier === 0 ? (s) => s : tier === 1 ? trimTrailing : trimEdges;
-const leadingIndent = (s: string): string => /^[ \t]*/.exec(s)![0];
+const buildNormalizer = (level: number): ((s: string) => string) =>
+  level === 0 ? (s) => s : level === 1 ? trimTrailing : trimEdges;
+
+const indentOf = (s: string): string => /^[ \t]*/.exec(s)![0];
 
 interface Piece {
   t: 'ctx' | 'old' | 'new';
@@ -297,28 +295,28 @@ interface Piece {
 }
 
 /** A file's lines, break kind, and whether it ends with a break. */
-function fileState(t: string): { lines: string[]; br: string; final: boolean } {
-  const nl = t.indexOf('\n');
-  const br = nl > 0 && t[nl - 1] === '\r' ? '\r\n' : '\n';
-  const lines = t === '' ? [] : t.split(br);
-  const final = t !== '' && t.endsWith(br);
+function parseFile(text: string): { lines: string[]; br: string; final: boolean } {
+  const idx = text.indexOf('\n');
+  const br = idx > 0 && text[idx - 1] === '\r' ? '\r\n' : '\n';
+  const lines = text === '' ? [] : text.split(br);
+  const final = text !== '' && text.endsWith(br);
   if (final) lines.pop();
   return { lines, br, final };
 }
 
-const fileText = (st: { lines: string[]; br: string; final: boolean }): string =>
+const renderFile = (st: { lines: string[]; br: string; final: boolean }): string =>
   st.lines.length === 0 ? '' : st.lines.join(st.br) + (st.final ? st.br : '');
 
 /** The lines written in place of O's matched lines, walking the body in order (context from the file; tier 2 reindents). */
-function bodySegment(fileLines: string[], at: number, items: Piece[], tier: number): string[] {
-  const reindent = tier === 2 && items.some((it) => it.t !== 'ctx');
-  const F = reindent ? leadingIndent(fileLines[at]!) : '';
-  const P = reindent ? leadingIndent(items[0]!.s) : '';
+function buildSegment(fileLines: string[], at: number, items: Piece[], level: number): string[] {
+  const reindent = level === 2 && items.some((it) => it.t !== 'ctx');
+  const F = reindent ? indentOf(fileLines[at]!) : '';
+  const P = reindent ? indentOf(items[0]!.s) : '';
   const seg: string[] = [];
   let pos = at;
   for (const it of items) {
-    if (it.t === 'ctx') { seg.push(fileLines[pos]!); pos += 1; }
-    else if (it.t === 'old') pos += 1;
+    if (it.t === 'ctx') { seg.push(fileLines[pos]!); pos++; }
+    else if (it.t === 'old') pos++;
     else {
       const s = it.s;
       if (reindent && s.trim() !== '' && s.startsWith(P)) seg.push(F + s.slice(P.length));
@@ -401,30 +399,30 @@ function readSection(lines: string[], idx: number, sec: USec): number {
 
 function applyHunks(st: { lines: string[]; br: string; final: boolean }, hunks: UHunk[], path: string, strict: boolean): void {
   let delta = 0;
-  const tiers = strict ? [0] : [0, 1, 2];
+  const levels = strict ? [0] : [0, 1, 2];
   for (const h of hunks) {
-    const O = h.items.filter((it) => it.t === 'ctx' || it.t === 'old').map((it) => ({ t: it.t === 'ctx' ? 'ctx' : 'old', s: it.s }) as Piece);
-    const N = h.items.filter((it) => it.t === 'ctx' || it.t === 'new').map((it) => ({ t: it.t === 'ctx' ? 'ctx' : 'new', s: it.s }) as Piece);
+    const oldPieces = h.items.filter((it) => it.t === 'ctx' || it.t === 'old').map((it) => ({ t: it.t === 'ctx' ? 'ctx' : 'old', s: it.s }) as Piece);
+    const newPieces = h.items.filter((it) => it.t === 'ctx' || it.t === 'new').map((it) => ({ t: it.t === 'ctx' ? 'ctx' : 'new', s: it.s }) as Piece);
     let lastNewIdx = -1;
-    for (let k = 0; k < h.items.length; k += 1) if (h.items[k]!.t === 'ctx' || h.items[k]!.t === 'new') lastNewIdx = k;
+    for (let k = 0; k < h.items.length; k++) if (h.items[k]!.t === 'ctx' || h.items[k]!.t === 'new') lastNewIdx = k;
     const noNl = lastNewIdx >= 0 && h.items[lastNewIdx + 1]?.t === 'bs';
     let atEnd = false;
-    if (O.length > 0) {
-      const found = locateLines(st.lines, O.map((o) => o.s), strict);
+    if (oldPieces.length > 0) {
+      const found = findMatches(st.lines, oldPieces.map((o) => o.s), strict);
       if (found === null) throw new Fail('no-match', path);
       const target = h.start - 1 + delta;
-      let best = found.positions[0]!;
-      for (const p of found.positions) if (Math.abs(p - target) < Math.abs(best - target)) best = p;
-      atEnd = best + O.length === st.lines.length;
-      const seg = bodySegment(st.lines, best, h.items.filter((it) => it.t !== 'bs').map((it) => ({ t: it.t === 'bs' ? 'ctx' : it.t, s: it.s }) as Piece), found.tier);
-      st.lines.splice(best, O.length, ...seg);
+      let best = found.indices[0]!;
+      for (const p of found.indices) if (Math.abs(p - target) < Math.abs(best - target)) best = p;
+      atEnd = best + oldPieces.length === st.lines.length;
+      const seg = buildSegment(st.lines, best, h.items.filter((it) => it.t !== 'bs').map((it) => ({ t: it.t === 'bs' ? 'ctx' : it.t, s: it.s }) as Piece), found.level);
+      st.lines.splice(best, oldPieces.length, ...seg);
     } else {
       const pos = Math.min(h.start + delta, st.lines.length);
       atEnd = pos >= st.lines.length;
-      st.lines.splice(pos, 0, ...N.map((it) => it.s));
+      st.lines.splice(pos, 0, ...newPieces.map((it) => it.s));
     }
     if (atEnd) st.final = !noNl;
-    delta += N.length - O.length;
+    delta += newPieces.length - oldPieces.length;
   }
 }
 
@@ -455,12 +453,12 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
       if (nw === null || nw === '/dev/null') continue;
       const p = nw;
       result.push((tree) => {
-        if (!safe(p)) throw new Fail('unsafe', p);
+        if (!isSafe(p)) throw new Fail('unsafe', p);
         if (tree.get(p) !== null) throw new Fail('exists', p);
         const flat = sec.hunks.flatMap((h) => h.items);
         const plus: string[] = [];
         let lastNew = -1;
-        for (let k = 0; k < flat.length; k += 1) {
+        for (let k = 0; k < flat.length; k++) {
           if (flat[k]!.t === 'new') { plus.push(flat[k]!.s); lastNew = k; }
         }
         const noNl = lastNew >= 0 && flat[lastNew + 1]?.t === 'bs';
@@ -472,7 +470,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
       if (old === null) continue;
       const p = old;
       result.push((tree) => {
-        if (!safe(p)) throw new Fail('unsafe', p);
+        if (!isSafe(p)) throw new Fail('unsafe', p);
         if (tree.get(p) === null) throw new Fail('missing', p);
         tree.now.set(p, null);
       });
@@ -480,15 +478,15 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
     }
     if (old !== null && nw !== null && old !== nw) {
       result.push((tree) => {
-        if (!safe(old)) throw new Fail('unsafe', old);
-        if (!safe(nw)) throw new Fail('unsafe', nw);
+        if (!isSafe(old)) throw new Fail('unsafe', old);
+        if (!isSafe(nw)) throw new Fail('unsafe', nw);
         const before = tree.get(old);
         if (before === null) throw new Fail('missing', old);
         if (tree.get(nw) !== null) throw new Fail('exists', nw);
-        const st = fileState(before);
+        const st = parseFile(before);
         applyHunks(st, sec.hunks, old, strict);
         tree.now.set(old, null);
-        tree.now.set(nw, fileText(st));
+        tree.now.set(nw, renderFile(st));
         tree.moves.push([old, nw]);
       });
       continue;
@@ -496,11 +494,11 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
     const p = old ?? nw;
     if (p === null || p === '/dev/null') continue;
     result.push((tree) => {
-      if (!safe(p)) throw new Fail('unsafe', p);
+      if (!isSafe(p)) throw new Fail('unsafe', p);
       if (tree.get(p) === null) throw new Fail('missing', p);
-      const st = fileState(tree.get(p)!);
+      const st = parseFile(tree.get(p)!);
       applyHunks(st, sec.hunks, p, strict);
-      tree.now.set(p, fileText(st));
+      tree.now.set(p, renderFile(st));
     });
   }
   return result;
@@ -527,7 +525,7 @@ function executeSegment(
   if (seg.mark !== null && seg.mark !== '') {
     let foundIdx = -1;
     for (const lvl of levelList) {
-      const fn = tierNormalizer(lvl);
+      const fn = buildNormalizer(lvl);
       const needle = fn(seg.mark);
       for (let scan = pos; scan < state.lines.length; scan++) {
         if (fn(state.lines[scan]!) === needle) { foundIdx = scan; break; }
@@ -550,7 +548,7 @@ function executeSegment(
   let matchAt = -1;
   let matchLevel = 0;
   for (const lvl of levelList) {
-    const fn = tierNormalizer(lvl);
+    const fn = buildNormalizer(lvl);
     const searchFor = oldParts.map(x => fn(x.s));
     for (let start = pos; start + oldParts.length <= state.lines.length; start++) {
       if (seg.isEof && start + oldParts.length !== state.lines.length) continue;
@@ -564,7 +562,7 @@ function executeSegment(
   }
   if (matchAt < 0) throw new Fail('no-match', target);
 
-  const rebuilt = bodySegment(state.lines, matchAt, seg.parts.map(p => ({ t: p.kind, s: p.text })) as Piece[], matchLevel);
+  const rebuilt = buildSegment(state.lines, matchAt, seg.parts.map(p => ({ t: p.kind, s: p.text })) as Piece[], matchLevel);
   state.lines.splice(matchAt, oldParts.length, ...rebuilt);
   return matchAt + newParts.length;
 }
@@ -612,7 +610,7 @@ function parseV4aPatch(srcLines: string[], strictMode: boolean): Edit[] {
       }
 
       results.push((tree) => {
-        if (!safe(path)) throw new Fail('unsafe', path);
+        if (!isSafe(path)) throw new Fail('unsafe', path);
         if (tree.get(path) !== null) throw new Fail('exists', path);
         tree.now.set(path, fileLines.length === 0 ? '' : `${fileLines.join('\n')}\n`);
       });
@@ -627,7 +625,7 @@ function parseV4aPatch(srcLines: string[], strictMode: boolean): Edit[] {
         if (!isBlank(srcLines[k]!)) throw new ParseExit(`error: parse ${k + 1}`);
       }
       results.push((tree) => {
-        if (!safe(path)) throw new Fail('unsafe', path);
+        if (!isSafe(path)) throw new Fail('unsafe', path);
         if (tree.get(path) === null) throw new Fail('missing', path);
         tree.now.set(path, null);
       });
@@ -679,14 +677,14 @@ function parseV4aPatch(srcLines: string[], strictMode: boolean): Edit[] {
       if (segments.length === 0 && renameTarget === null) throw new ParseExit(`error: parse ${cursor + 1}`);
 
       results.push((tree) => {
-        if (!safe(path)) throw new Fail('unsafe', path);
-        if (renameTarget !== null && !safe(renameTarget)) throw new Fail('unsafe', renameTarget);
+        if (!isSafe(path)) throw new Fail('unsafe', path);
+        if (renameTarget !== null && !isSafe(renameTarget)) throw new Fail('unsafe', renameTarget);
         const original = tree.get(path);
         if (original === null) throw new Fail('missing', path);
-        const state = fileState(original);
+        const state = parseFile(original);
         let pos = 0;
         for (const seg of segments) pos = executeSegment(state, seg, path, strictMode, pos);
-        const finalText = fileText(state);
+        const finalText = renderFile(state);
         if (renameTarget !== null) {
           if (tree.get(renameTarget) !== null) throw new Fail('exists', renameTarget);
           tree.now.set(path, null);
@@ -740,7 +738,7 @@ function run(args: string[]): { code: number; out: string[] } {
     if (patchPath !== null) return { code: 2, out: ['error: no-patch'] };
   }
 
-  const patchLineArray = patchLines(rawText);
+  const patchLineArray = splitPatchLines(rawText);
   const detectedKind = selectedFormat === null || selectedFormat === 'auto' ? detect(patchLineArray) : selectedFormat;
   if (detectedKind === null) return { code: 2, out: ['error: format'] };
 
