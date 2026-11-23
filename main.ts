@@ -331,17 +331,17 @@ function bodySegment(fileLines: string[], at: number, items: Piece[], tier: numb
 // ---- Section 6: unified diffs ----
 
 interface UHunk {
-  a: number;
+  start: number;
   items: { t: 'ctx' | 'old' | 'new' | 'bs'; s: string }[];
 }
 
-function extractHunkLine(l: string): number | null {
+function parseHunkHeader(l: string): number | null {
   const m = /^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@/.exec(l);
   return m === null ? null : Number(m[1]);
 }
 
-const afterFour = (l: string): string => l.slice(4).split('\t')[0]!.trim();
-const stripAB = (p: string): string => (p === '/dev/null' ? p : p.startsWith('a/') || p.startsWith('b/') ? p.slice(2) : p);
+const trimAfterFour = (l: string): string => l.slice(4).split('\t')[0]!.trim();
+const stripPrefix = (p: string): string => (p === '/dev/null' ? p : p.startsWith('a/') || p.startsWith('b/') ? p.slice(2) : p);
 
 interface USec {
   gitOld: string | null;
@@ -356,80 +356,80 @@ interface USec {
   hunks: UHunk[];
 }
 
-function parseSection(lines: string[], i: number, sec: USec): number {
-  while (i < lines.length) {
-    const l = lines[i]!;
-    const a = extractHunkLine(l);
-    if (a !== null) {
-      i += 1;
+function readSection(lines: string[], idx: number, sec: USec): number {
+  while (idx < lines.length) {
+    const l = lines[idx]!;
+    const h = parseHunkHeader(l);
+    if (h !== null) {
+      idx += 1;
       const items: UHunk['items'] = [];
-      while (i < lines.length) {
-        const c = lines[i]!;
-        if (c.startsWith('diff --git ') || (c.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ '))) break;
-        if (c.startsWith(' ')) { items.push({ t: 'ctx', s: c.slice(1) }); i += 1; }
-        else if (c.startsWith('-')) { items.push({ t: 'old', s: c.slice(1) }); i += 1; }
-        else if (c.startsWith('+')) { items.push({ t: 'new', s: c.slice(1) }); i += 1; }
-        else if (c.startsWith('\\')) { items.push({ t: 'bs', s: c }); i += 1; }
-        else if (c === '') { items.push({ t: 'ctx', s: '' }); i += 1; }
+      while (idx < lines.length) {
+        const c = lines[idx]!;
+        if (c.startsWith('diff --git ') || (c.startsWith('--- ') && (lines[idx + 1] ?? '').startsWith('+++ '))) break;
+        if (c.startsWith(' ')) { items.push({ t: 'ctx', s: c.slice(1) }); idx += 1; }
+        else if (c.startsWith('-')) { items.push({ t: 'old', s: c.slice(1) }); idx += 1; }
+        else if (c.startsWith('+')) { items.push({ t: 'new', s: c.slice(1) }); idx += 1; }
+        else if (c.startsWith('\\')) { items.push({ t: 'bs', s: c }); idx += 1; }
+        else if (c === '') { items.push({ t: 'ctx', s: '' }); idx += 1; }
         else break;
       }
       while (items.length > 0 && items[items.length - 1]!.t === 'ctx' && items[items.length - 1]!.s === '') items.pop();
-      sec.hunks.push({ a, items });
+      sec.hunks.push({ start: h, items });
       continue;
     }
-    if (l.startsWith('diff --git ')) return i;
+    if (l.startsWith('diff --git ')) return idx;
     if (l.startsWith('--- ')) {
-      if ((lines[i + 1] ?? '').startsWith('+++ ')) {
-        if (sec.sawPair || sec.hunks.length > 0) return i;
-        sec.old = stripAB(afterFour(l));
-        sec.nw = stripAB(afterFour(lines[i + 1]!));
+      if ((lines[idx + 1] ?? '').startsWith('+++ ')) {
+        if (sec.sawPair || sec.hunks.length > 0) return idx;
+        sec.old = stripPrefix(trimAfterFour(l));
+        sec.nw = stripPrefix(trimAfterFour(lines[idx + 1]!));
         sec.sawPair = true;
-        i += 2;
+        idx += 2;
         continue;
       }
-      throw new ParseExit(`error: parse ${i + 2}`);
+      throw new ParseExit(`error: parse ${idx + 2}`);
     }
-    if (l.startsWith('rename from ')) { if (sec.renameOld === null) sec.renameOld = l.slice(12).trim(); i += 1; continue; }
-    if (l.startsWith('rename to ')) { if (sec.renameNew === null) sec.renameNew = l.slice(10).trim(); i += 1; continue; }
-    if (l.startsWith('new file mode')) { sec.create = true; i += 1; continue; }
-    if (l.startsWith('deleted file mode')) { sec.del = true; i += 1; continue; }
-    if (l.startsWith('@@')) throw new ParseExit(`error: parse ${i + 1}`);
-    i += 1;
+    if (l.startsWith('rename from ')) { if (sec.renameOld === null) sec.renameOld = l.slice(12).trim(); idx += 1; continue; }
+    if (l.startsWith('rename to ')) { if (sec.renameNew === null) sec.renameNew = l.slice(10).trim(); idx += 1; continue; }
+    if (l.startsWith('new file mode')) { sec.create = true; idx += 1; continue; }
+    if (l.startsWith('deleted file mode')) { sec.del = true; idx += 1; continue; }
+    if (l.startsWith('@@')) throw new ParseExit(`error: parse ${idx + 1}`);
+    idx += 1;
   }
-  return i;
+  return idx;
 }
 
 function applyHunks(st: { lines: string[]; br: string; final: boolean }, hunks: UHunk[], path: string, strict: boolean): void {
-  let d = 0;
+  let delta = 0;
   const tiers = strict ? [0] : [0, 1, 2];
   for (const h of hunks) {
     const O = h.items.filter((it) => it.t === 'ctx' || it.t === 'old').map((it) => ({ t: it.t === 'ctx' ? 'ctx' : 'old', s: it.s }) as Piece);
     const N = h.items.filter((it) => it.t === 'ctx' || it.t === 'new').map((it) => ({ t: it.t === 'ctx' ? 'ctx' : 'new', s: it.s }) as Piece);
-    let lastCn = -1;
-    for (let k = 0; k < h.items.length; k += 1) if (h.items[k]!.t === 'ctx' || h.items[k]!.t === 'new') lastCn = k;
-    const noNl = lastCn >= 0 && h.items[lastCn + 1]?.t === 'bs';
-    let endAtEnd = false;
+    let lastNewIdx = -1;
+    for (let k = 0; k < h.items.length; k += 1) if (h.items[k]!.t === 'ctx' || h.items[k]!.t === 'new') lastNewIdx = k;
+    const noNl = lastNewIdx >= 0 && h.items[lastNewIdx + 1]?.t === 'bs';
+    let atEnd = false;
     if (O.length > 0) {
       const found = locateLines(st.lines, O.map((o) => o.s), strict);
       if (found === null) throw new Fail('no-match', path);
-      const target = h.a - 1 + d;
+      const target = h.start - 1 + delta;
       let best = found.positions[0]!;
       for (const p of found.positions) if (Math.abs(p - target) < Math.abs(best - target)) best = p;
-      endAtEnd = best + O.length === st.lines.length;
+      atEnd = best + O.length === st.lines.length;
       const seg = bodySegment(st.lines, best, h.items.filter((it) => it.t !== 'bs').map((it) => ({ t: it.t === 'bs' ? 'ctx' : it.t, s: it.s }) as Piece), found.tier);
       st.lines.splice(best, O.length, ...seg);
     } else {
-      const pos = Math.min(h.a + d, st.lines.length);
-      endAtEnd = pos >= st.lines.length;
+      const pos = Math.min(h.start + delta, st.lines.length);
+      atEnd = pos >= st.lines.length;
       st.lines.splice(pos, 0, ...N.map((it) => it.s));
     }
-    if (endAtEnd) st.final = !noNl;
-    d += N.length - O.length;
+    if (atEnd) st.final = !noNl;
+    delta += N.length - O.length;
   }
 }
 
 function unifiedEdits(lines: string[], strict: boolean): Edit[] {
-  const edits: Edit[] = [];
+  const result: Edit[] = [];
   let i = 0;
   while (i < lines.length) {
     const l = lines[i]!;
@@ -438,13 +438,13 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
       const m = /^diff --git a\/(.*) b\/(.*)$/.exec(l);
       if (m === null) throw new ParseExit(`error: parse ${i + 1}`);
       sec = { gitOld: m[1]!, gitNew: m[2]!, old: null, nw: null, renameOld: null, renameNew: null, create: false, del: false, sawPair: false, hunks: [] };
-      i = parseSection(lines, i + 1, sec);
+      i = readSection(lines, i + 1, sec);
     } else if (l.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')) {
       sec = { gitOld: null, gitNew: null, old: null, nw: null, renameOld: null, renameNew: null, create: false, del: false, sawPair: false, hunks: [] };
-      sec.old = stripAB(afterFour(l));
-      sec.nw = stripAB(afterFour(lines[i + 1]!));
+      sec.old = stripPrefix(trimAfterFour(l));
+      sec.nw = stripPrefix(trimAfterFour(lines[i + 1]!));
       sec.sawPair = true;
-      i = parseSection(lines, i + 2, sec);
+      i = readSection(lines, i + 2, sec);
     } else {
       i += 1;
       continue;
@@ -454,7 +454,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
     if (sec.create || old === '/dev/null') {
       if (nw === null || nw === '/dev/null') continue;
       const p = nw;
-      edits.push((tree) => {
+      result.push((tree) => {
         if (!safe(p)) throw new Fail('unsafe', p);
         if (tree.get(p) !== null) throw new Fail('exists', p);
         const flat = sec.hunks.flatMap((h) => h.items);
@@ -471,7 +471,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
     if (sec.del || nw === '/dev/null') {
       if (old === null) continue;
       const p = old;
-      edits.push((tree) => {
+      result.push((tree) => {
         if (!safe(p)) throw new Fail('unsafe', p);
         if (tree.get(p) === null) throw new Fail('missing', p);
         tree.now.set(p, null);
@@ -479,7 +479,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
       continue;
     }
     if (old !== null && nw !== null && old !== nw) {
-      edits.push((tree) => {
+      result.push((tree) => {
         if (!safe(old)) throw new Fail('unsafe', old);
         if (!safe(nw)) throw new Fail('unsafe', nw);
         const before = tree.get(old);
@@ -495,7 +495,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
     }
     const p = old ?? nw;
     if (p === null || p === '/dev/null') continue;
-    edits.push((tree) => {
+    result.push((tree) => {
       if (!safe(p)) throw new Fail('unsafe', p);
       if (tree.get(p) === null) throw new Fail('missing', p);
       const st = fileState(tree.get(p)!);
@@ -503,7 +503,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
       tree.now.set(p, fileText(st));
     });
   }
-  return edits;
+  return result;
 }
 
 // ---- Section 8: V4A patches ----
